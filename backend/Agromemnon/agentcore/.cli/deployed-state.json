@@ -1,0 +1,30 @@
+{
+  "targets": {
+    "personal": {
+      "resources": {
+        "runtimes": {
+          "Agromemnon": {
+            "runtimeId": "Agromemnon_Agromemnon-HJ1ia4DIkG",
+            "runtimeArn": "arn:aws:bedrock-agentcore:ap-south-1:879835157388:runtime/Agromemnon_Agromemnon-HJ1ia4DIkG",
+            "roleArn": "arn:aws:iam::879835157388:role/AgentCore-Agromemnon-pers-ApplicationAgentAgromemno-xkMGaDQiwLjH"
+          }
+        },
+        "stackName": "AgentCore-Agromemnon-personal",
+        "deployHash": "5392b0762cdda3d2"
+      }
+    },
+    "main": {
+      "resources": {
+        "runtimes": {
+          "Agromemnon": {
+            "runtimeId": "Agromemnon_Agromemnon-uab11aG02w",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:222758971755:runtime/Agromemnon_Agromemnon-uab11aG02w",
+            "roleArn": "arn:aws:iam::222758971755:role/AgentCore-Agromemnon-main-ApplicationAgentAgromemno-mmuJglOEI7Jw"
+          }
+        },
+        "stackName": "AgentCore-Agromemnon-main",
+        "deployHash": "9a2d09b497747f88"
+      }
+    }
+  }
+}

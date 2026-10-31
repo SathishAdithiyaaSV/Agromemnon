@@ -1,0 +1,94 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "Agromemnon",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "Agromemnon"
+  },
+  "runtimes": [
+    {
+      "name": "Agromemnon",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/Agromemnon/",
+      "runtimeVersion": "PYTHON_3_14",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        {
+          "name": "MANDI_PRICES_TABLE",
+          "value": "Agromemnon-mandi-prices"
+        },
+        {
+          "name": "SOIL_NUTRIENTS_TABLE",
+          "value": "Agromemnon-soil-nutrients"
+        },
+        {
+          "name": "SCHEME_KB_ID",
+          "value": "IY3TP8DVNA"
+        },
+        {
+          "name": "SCHEME_KB_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "AGENTCORE_MEMORY_NAME",
+          "value": "AgromemnonFarmerMemory"
+        },
+        {
+          "name": "GEMINI_API_KEY_SECRET",
+          "value": "Agromemnon/gemini-api-key"
+        },
+        {
+          "name": "VISION_MODEL_ID",
+          "value": "us.amazon.nova-pro-v1:0"
+        },
+        {
+          "name": "VISION_MODEL_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "TEXT_MODEL_ID",
+          "value": "us.amazon.nova-pro-v1:0"
+        },
+        {
+          "name": "TEXT_MODEL_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "WEATHERAPI_KEY_SECRET",
+          "value": "Agromemnon/weatherapi-key"
+        },
+        {
+          "name": "DATA_GOV_API_KEY_SECRET",
+          "value": "Agromemnon/data-gov-api-key"
+        }
+      ],
+      "additionalPolicies": [
+        "policies/dynamodb-mandi-prices.json",
+        "policies/dynamodb-soil-nutrients.json",
+        "policies/bedrock-scheme-kb.json",
+        "policies/agentcore-memory.json",
+        "policies/gemini-api-key.json",
+        "policies/external-api-keys.json",
+        "policies/bedrock-text-model.json",
+        "policies/bedrock-vision-model.json"
+      ]
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "capacityProviders": [],
+  "payments": []
+}
