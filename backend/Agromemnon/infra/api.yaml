@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Public HTTP API for the Agromemnon agent. API Gateway (HTTP API, CORS open) fronts a
+  Lambda that invokes the deployed AgentCore runtime and returns the agent's reply as
+  JSON, so a browser frontend can call it directly without AWS credentials.
+
+Parameters:
+  AgentRuntimeArn:
+    Type: String
+    Description: ARN of the deployed AgentCore runtime to invoke.
+    AllowedPattern: ^arn:aws:bedrock-agentcore:[a-z0-9-]+:\d{12}:runtime/.+$
+
+  ProjectName:
+    Type: String
+    Default: Agromemnon
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+  # Leave both empty to keep the endpoint open (the original behaviour). Set both
+  # to the outputs of infra/auth.yaml and the route starts requiring a Cognito ID
+  # token in the Authorization header.
+  UserPoolId:
+    Type: String
+    Default: ''
+    Description: Cognito user pool ID whose ID tokens may call this API.
+
+  UserPoolClientId:
+    Type: String
+    Default: ''
+    Description: Cognito app client ID; becomes the JWT audience the authorizer checks.
+
+Conditions:
+  RequireAuth: !And
+    - !Not [!Equals [!Ref UserPoolId, '']]
+    - !Not [!Equals [!Ref UserPoolClientId, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Lambda role
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: invoke-agent-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                # Both forms are needed: the bare runtime ARN and the qualified
+                # ARN that addresses a specific endpoint (for example /DEFAULT).
+                Resource:
+                  - !Ref AgentRuntimeArn
+                  - !Sub '${AgentRuntimeArn}/*'
+      Tags:
+        - Key: agentcore:project-name
+          Value: !Ref ProjectName
+
+  # Declared explicitly so the logs expire; an implicitly created Lambda log
+  # group keeps them forever.
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-chat'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ------------------------------------------------------------------- Lambda
+  ChatFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-chat'
+      Description: Invokes the AgentCore runtime and returns the agent reply as JSON.
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt FunctionRole.Arn
+      # API Gateway gives up at 30s, so the function must return before that and
+      # produce its own message rather than letting the gateway emit a bare 504.
+      Timeout: 29
+      # The work is network-bound, but more memory also means more CPU, which
+      # shortens the JSON/SSE parsing inside that 29s budget.
+      MemorySize: 1024
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+      Tags:
+        - Key: agentcore:project-name
+          Value: !Ref ProjectName
+      # Inlined so the whole API deploys from this one file with no build step and
+      # no S3 bucket. Lambda caps inline source at 4096 characters, so the notes
+      # that would normally be comments in the handler live here instead:
+      #
+      #   * _reply sets no CORS headers on purpose. The HTTP API below owns CORS;
+      #     a second Access-Control-Allow-Origin makes browsers reject the response.
+      #   * actorId and profile are read from the JWT claims that the authorizer has
+      #     already verified, never from the request body. They key the farmer's
+      #     AgentCore Memory, so a body-supplied actorId would let any caller read
+      #     another farmer's remembered soil readings and scheme history by guessing
+      #     their sub. When the route runs unauthenticated there are no claims and
+      #     the runtime falls back to a session-scoped anonymous actor.
+      #   * The runtime requires a session id of at least 33 characters. A shorter
+      #     client id is padded with a hash of itself rather than a random value, so
+      #     the same browser keeps reaching the same agent session (and its history).
+      #   * _collect reads the runtime's SSE stream. Only contentBlockDelta.delta.text
+      #     is answer text; delta.toolUse carries tool arguments and must be skipped.
+      #   * _collect stops at a deadline derived from the function's remaining time and
+      #     returns whatever text arrived, flagged as truncated. A per-read timeout is
+      #     not enough on its own: SSE events keep trickling in, so no single read ever
+      #     stalls while the turn as a whole runs past the 30s gateway limit.
+      #   * The exception detail is logged, not returned: it reached the browser before
+      #     and carried internals with it.
+      #   * An optional "image" data URL is forwarded to the runtime untouched. It is
+      #     deliberately not validated here: app/Agromemnon/image_store.py already
+      #     checks the format and size, and it can answer a bad upload as the adviser
+      #     ("send it again as a JPEG") instead of a bare 400 the farmer never sees.
+      #     Oversized bodies are API Gateway's job — it rejects above 10 MB itself.
+      #   * A photo may arrive with no words at all — the composer lets a farmer send
+      #     just a picture — so an empty prompt is valid when "image" is present.
+      #   * This source is ~15 characters under Lambda's 4096 inline cap. `prof` is
+      #     named short for that reason alone. The next addition here does not fit:
+      #     move the handler to an S3 artifact rather than shortening prose further.
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import os
+          import re
+          import time
+
+          import boto3
+          from botocore.config import Config
+
+          RUNTIME_ARN = os.environ["AGENT_RUNTIME_ARN"]
+          client = boto3.client("bedrock-agentcore",
+                                config=Config(read_timeout=26, connect_timeout=5, retries={"max_attempts": 0}))
+
+          def _reply(status, body):
+              return {"statusCode": status,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body)}
+
+          def _session_id(raw):
+              cleaned = re.sub(r"[^A-Za-z0-9_-]", "-", (raw or "").strip())
+              if not cleaned:
+                  return os.urandom(20).hex()
+              if len(cleaned) < 33:
+                  cleaned += "-" + hashlib.sha256(cleaned.encode()).hexdigest()
+              return cleaned[:128]
+
+          def _collect(stream, deadline):
+              chunks, stop, usage, error, cut = [], None, None, None, False
+              for line in stream.iter_lines():
+                  if time.monotonic() > deadline:
+                      cut = True
+                      break
+                  if not line or not line.startswith(b"data:"):
+                      continue
+                  try:
+                      event = json.loads(line[5:].strip() or b"{}")
+                  except json.JSONDecodeError:
+                      continue
+                  if not isinstance(event, dict):
+                      continue
+                  if event.get("error"):
+                      error = str(event["error"])
+                      continue
+                  inner = event.get("event")
+                  if not isinstance(inner, dict):
+                      continue
+                  text = (inner.get("contentBlockDelta") or {}).get("delta", {}).get("text")
+                  if isinstance(text, str):
+                      chunks.append(text)
+                  stop = (inner.get("messageStop") or {}).get("stopReason") or stop
+                  usage = (inner.get("metadata") or {}).get("usage") or usage
+              return "".join(chunks), stop, usage, error, cut
+
+          def handler(event, context):
+              try:
+                  body = json.loads(event.get("body") or "{}")
+              except json.JSONDecodeError:
+                  body = None
+              if not isinstance(body, dict):
+                  return _reply(400, {"error": "Body must be a JSON object."})
+              prompt = body.get("prompt", "")
+              img = body.get("image")
+              img = img if type(img) is str else None
+              if not isinstance(prompt, str) or not (prompt.strip() or img):
+                  return _reply(400, {"error": "Need a 'prompt' or 'image'."})
+
+              session_id = _session_id(body.get("sessionId"))
+              payload = {"prompt": prompt, **({"image": img} if img else {})}
+              auth = (event.get("requestContext") or {}).get("authorizer") or {}
+              claims = (auth.get("jwt") or {}).get("claims") or {}
+              if claims.get("sub"):
+                  payload["actorId"] = claims["sub"]
+              prof = {f: claims.get(f) or claims.get("custom:" + f)
+                      for f in ("name", "state", "district", "language", "age")}
+              prof = {k: v for k, v in prof.items() if v}
+              if prof:
+                  payload["profile"] = prof
+
+              left = context.get_remaining_time_in_millis() / 1000 if context else 29
+              deadline = time.monotonic() + max(left - 3, 5)
+              try:
+                  response = client.invoke_agent_runtime(
+                      agentRuntimeArn=RUNTIME_ARN,
+                      runtimeSessionId=session_id,
+                      payload=json.dumps(payload).encode("utf-8"),
+                  )
+                  answer, stop, usage, error, cut = _collect(response["response"], deadline)
+              except client.exceptions.ThrottlingException:
+                  return _reply(429, {"error": "Agent busy; retry shortly.", "sessionId": session_id})
+              except Exception as exc:
+                  print(f"invoke failed: {exc!r}")
+                  return _reply(502, {"error": "The agent could not be reached.", "sessionId": session_id})
+
+              if not answer:
+                  if cut:
+                      return _reply(504, {"error": "Timed out; ask something narrower.",
+                                          "sessionId": session_id})
+                  return _reply(502, {"error": error or "The agent returned no text.",
+                                      "sessionId": session_id})
+
+              result = {"response": answer, "sessionId": session_id}
+              for key, value in (("stopReason", stop), ("usage", usage),
+                                 ("warning", error), ("truncated", cut or None)):
+                  if value:
+                      result[key] = value
+              return _reply(200, result)
+
+  # --------------------------------------------------------------- HTTP API
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      Description: Public chat endpoint for the Agromemnon agent.
+      ProtocolType: HTTP
+      # Allow-all CORS. AllowCredentials must stay off: browsers reject
+      # credentialed requests against a wildcard origin.
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: ['*']
+        AllowHeaders: ['*']
+        MaxAge: 300
+      Tags:
+        agentcore:project-name: !Ref ProjectName
+
+  ChatIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ChatFunction.Arn
+      PayloadFormatVersion: '2.0'
+      # 30s is the HTTP API ceiling; a longer agent turn cannot be served
+      # synchronously and needs streaming or an async job instead.
+      TimeoutInMillis: 30000
+
+  # API Gateway validates the token's signature, issuer, audience and expiry before
+  # the Lambda runs, so the function never sees an unauthenticated request. The
+  # frontend sends the ID token (not the access token) because that is the one
+  # carrying the audience claim this authorizer matches against.
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: RequireAuth
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: !Sub '${ProjectName}-cognito'
+      AuthorizerType: JWT
+      IdentitySource: ['$request.header.Authorization']
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClientId]
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
+
+  ChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /chat'
+      Target: !Sub 'integrations/${ChatIntegration}'
+      AuthorizationType: !If [RequireAuth, JWT, NONE]
+      AuthorizerId: !If [RequireAuth, !Ref JwtAuthorizer, !Ref 'AWS::NoValue']
+
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/chat'
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the HTTP API.
+    Value: !GetAtt HttpApi.ApiEndpoint
+
+  ChatEndpoint:
+    Description: 'POST JSON: {"prompt": "...", "sessionId": "...", "image": "data:image/jpeg;base64,..."}; image is optional.'
+    Value: !Sub '${HttpApi.ApiEndpoint}/chat'
+
+  FunctionName:
+    Value: !Ref ChatFunction
+
+  AuthMode:
+    Description: Whether the /chat route requires a Cognito ID token.
+    Value: !If [RequireAuth, 'JWT (Cognito ID token required)', 'NONE (open endpoint)']
