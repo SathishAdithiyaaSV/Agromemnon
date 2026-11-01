@@ -64,6 +64,10 @@ picture and a fertilizer dose from their district alone, without holding a Soil 
 Card of their own. Every figure it returns is an area average from sampled fields, and the
 caveat travels with the data so an answer never presents it as a measurement of one plot.
 
+### Datasets
+All the datasets are taken from government sources and is not hardcoded as jsons
+We are also using KCC datasets to get a knowledge base from https://aikosh.indiaai.gov.in/home/datasets/details/kisan_call_centre_kcc_transcripts_of_farmers_queries_and_answers.html
+
 ### Skills
 
 Field procedure that is too long for every system prompt and too situational to hard-code
